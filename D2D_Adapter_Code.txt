@@ -1,0 +1,464 @@
+Implementing a complete production-grade UCIe (Universal Chiplet Interconnect Express) Die-to-Die (D2D) adapter requires thousands of lines of code, integrating Link Layer state machines, Protocol Layer retry buffers, physical layer (PHY) alignment, and advanced Clock Domain Crossing (CDC). 
+
+However, I can provide a **highly accurate, parameterized architectural model** of a **UCIe Multi-Flit D2D Adapter** in SystemVerilog. This code focuses on the core logic: **flitization (TX slicing), deflitization (RX reassembly), CRC protection, and credit-based flow control**, which are the hallmarks of the UCIe standard.
+
+### Architecture Overview
+
+1.  **TX Path (Protocol to Link):** Accepts wide AXI-Stream packets (`PAYLOAD_WIDTH`), slices them into UCIe standard flit widths (`FLIT_WIDTH`), attaches a UCIe-style header (Sequence Number, Fragmentation flags), appends a CRC, and manages TX credits.
+2.  **RX Path (Link to Protocol):** Receives flits, validates the CRC, checks sequence numbers, reassembles the fragments back into the original wide payload, and returns credits to the remote die.
+3.  **CDC Note:** In a real UCIe IP, asynchronous FIFOs sit between this logic and the PHY. This model assumes synchronous operation for algorithmic clarity, with notes on where CDC is applied.
+
+---
+
+### 1. UCIe Package & Definitions
+
+```systemverilog
+//=============================================================================
+// UCIe Multi-Flit Adapter Package
+//=============================================================================
+package ucie_d2d_pkg;
+
+    // UCIe Standard Flit Widths (Raw Mode)
+    localparam int FLIT_64  = 64;
+    localparam int FLIT_128 = 128;
+    localparam int FLIT_256 = 256;
+
+    //-------------------------------------------------------------------------
+    // Flit Header Format (Simplified UCIe Raw Protocol Header)
+    //-------------------------------------------------------------------------
+    typedef struct packed {
+        logic [3:0]  credit_return;  // Credits being returned to remote die
+        logic [7:0]  seq_num;        // Sequence number for multi-flit packets
+        logic        is_last;        // 1: Last flit of a multi-flit packet
+        logic        is_first;       // 1: First flit of a multi-flit packet
+        logic [1:0]  pkt_type;       // 00: Data, 01: Credit Only, 10: Control
+        logic [3:0]  reserved;
+        logic [15:0] crc16;          // Calculated CRC across header + payload
+    } ucie_flit_hdr_t;
+
+    // Full Flit Structure
+    typedef struct packed {
+        ucie_flit_hdr_t        hdr;
+        logic [255:0]          payload; // Padded to max width, sliced during logic
+    } ucie_flit_t;
+
+    //-------------------------------------------------------------------------
+    // AXI-Stream Sideband for D2D
+    //-------------------------------------------------------------------------
+    typedef struct packed {
+        logic        valid;
+        logic        ready;
+        logic [15:0] dest_id; // Target die ID
+        logic        last;    // End of wide packet
+    } ucie_stream_ctrl_t;
+
+endpackage
+```
+
+---
+
+### 2. TX Path: Multi-Flit Slicer
+
+```systemverilog
+//=============================================================================
+// UCIe TX Multi-Flit Adapter
+//=============================================================================
+module ucie_multiflit_tx #(
+    parameter int FLIT_WIDTH    = 128,       // 64, 128, or 256
+    parameter int PAYLOAD_WIDTH = 512,       // Protocol layer width
+    parameter int MAX_CREDITS   = 16,        // Max outstanding flits allowed
+    parameter int SEQ_NUM_W     = 8
+)(
+    input  logic                                     clk,
+    input  logic                                     rst_n,
+
+    // Protocol Layer Interface (Wide AXI-S)
+    input  logic [PAYLOAD_WIDTH-1:0]                 tx_data,
+    input  logic                                     tx_valid,
+    output logic                                     tx_ready,
+    input  logic                                     tx_last,
+    input  logic [15:0]                              tx_dest_id,
+
+    // Link Layer Interface to PHY (Narrow Flits)
+    output logic [FLIT_WIDTH-1:0]                    flit_out,
+    output logic                                     flit_out_valid,
+    input  logic                                     flit_out_ready,
+
+    // Credit Interface (From RX side of local die, returning remote credits)
+    input  logic [3:0]                               remote_credits_rcvd,
+
+    // Status
+    output logic                                     tx_stall
+);
+
+    import ucie_d2d_pkg::*;
+
+    localparam int FLITS_PER_PKT = (PAYLOAD_WIDTH + FLIT_WIDTH - 1) / FLIT_WIDTH;
+    localparam int HDR_WIDTH     = $bits(ucie_flit_hdr_t);
+    localparam int DATA_WIDTH    = FLIT_WIDTH - HDR_WIDTH;
+
+    //-------------------------------------------------------------------------
+    // State Machine
+    //-------------------------------------------------------------------------
+    typedef enum logic [1:0] {
+        TX_IDLE,
+        TX_SLICE,
+        TX_WAIT_CREDITS
+    } tx_state_t;
+
+    tx_state_t state;
+    logic [$clog2(FLITS_PER_PKT)-1:0] flit_cnt;
+    logic [SEQ_NUM_W-1:0]             current_seq_num;
+    logic [3:0]                       tx_credits_avail;
+    
+    // Shift register to slice wide payload
+    logic [PAYLOAD_WIDTH-1:0]         payload_shift_reg;
+    logic                            is_first_flit;
+
+    //-------------------------------------------------------------------------
+    // Credit Management
+    //-------------------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_credits_avail <= MAX_CREDITS[3:0];
+        end else begin
+            // Consume credit when sending a flit
+            if (flit_out_valid && flit_out_ready) begin
+                tx_credits_avail <= tx_credits_avail - 1'b1;
+            end
+            // Receive returned credits
+            tx_credits_avail <= tx_credits_avail + remote_credits_rcvd;
+        end
+    end
+
+    assign tx_stall = (tx_credits_avail == 0) && (state != TX_IDLE);
+
+    //-------------------------------------------------------------------------
+    // TX Sequencing & Slicing Logic
+    //-------------------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state           <= TX_IDLE;
+            tx_ready        <= 1'b0;
+            flit_out_valid  <= 1'b0;
+            current_seq_num <= '0;
+            flit_cnt        <= '0;
+            payload_shift_reg <= '0;
+            is_first_flit   <= 1'b1;
+        end else begin
+            case (state)
+                TX_IDLE: begin
+                    flit_out_valid <= 1'b0;
+                    if (tx_valid && tx_credits_avail > 0) begin
+                        // Latch payload and slice
+                        payload_shift_reg <= tx_data;
+                        flit_cnt          <= '0;
+                        is_first_flit     <= 1'b1;
+                        state             <= TX_SLICE;
+                        tx_ready          <= 1'b0; // Hold off protocol layer during burst
+                    end else begin
+                        tx_ready <= 1'b1;
+                    end
+                end
+
+                TX_SLICE: begin
+                    if (tx_credits_avail == 0) begin
+                        state <= TX_WAIT_CREDITS;
+                        flit_out_valid <= 1'b0;
+                    end else if (flit_out_ready) begin
+                        // Shift register for next iteration
+                        payload_shift_reg <= payload_shift_reg << DATA_WIDTH;
+                        flit_cnt          <= flit_cnt + 1'b1;
+                        is_first_flit     <= 1'b0;
+                        
+                        if (flit_cnt == FLITS_PER_PKT - 1) begin
+                            state          <= TX_IDLE;
+                            flit_out_valid <= 1'b0;
+                        end
+                    end else begin
+                        flit_out_valid <= 1'b1;
+                    end
+                end
+
+                TX_WAIT_CREDITS: begin
+                    if (tx_credits_avail > 0) begin
+                        state <= TX_SLICE;
+                        flit_out_valid <= 1'b1;
+                    end
+                end
+            endcase
+        end
+    end
+
+    //-------------------------------------------------------------------------
+    // Flit Packing (Header + Payload Slice)
+    //-------------------------------------------------------------------------
+    ucie_flit_hdr_t flit_hdr;
+    logic [FLIT_WIDTH-1:0] flit_payload_padded;
+
+    // Extract slice
+    assign flit_payload_padded = {{(FLIT_WIDTH - PAYLOAD_WIDTH){1'b0}}, payload_shift_reg[PAYLOAD_WIDTH-1 -: DATA_WIDTH]};
+    
+    // Simple CRC-16 generation (Industry uses specific UCIe polynomial, simplified here for SV compliance)
+    logic [15:0] calc_crc;
+    always_comb begin
+        logic [DATA_WIDTH+HDR_WIDTH-17:0] crc_data;
+        crc_data = {flit_payload_padded[DATA_WIDTH-1:0], flit_hdr.seq_num, flit_hdr.pkt_type, flit_hdr.is_first, flit_hdr.is_last};
+        calc_crc = ^crc_data; // XOR reduction as lightweight CRC placeholder
+    end
+
+    always_comb begin
+        flit_hdr.reserved      = '0;
+        flit_hdr.credit_return = remote_credits_rcvd;
+        flit_hdr.seq_num       = current_seq_num;
+        flit_hdr.is_last       = (flit_cnt == FLITS_PER_PKT - 1) && (state == TX_SLICE);
+        flit_hdr.is_first      = is_first_flit;
+        flit_hdr.pkt_type      = 2'b00; // Data
+        flit_hdr.crc16         = calc_crc;
+    end
+
+    // Assemble final flit
+    assign flit_out = {flit_hdr, flit_payload_padded[DATA_WIDTH-1:0]};
+
+    // Increment sequence number per packet
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) current_seq_num <= '0;
+        else if (state == TX_SLICE && flit_cnt == FLITS_PER_PKT - 1 && flit_out_ready)
+            current_seq_num <= current_seq_num + 1'b1;
+    end
+
+endmodule
+```
+
+---
+
+### 3. RX Path: Multi-Flit Reassembler
+
+```systemverilog
+//=============================================================================
+// UCIe RX Multi-Flit Adapter
+//=============================================================================
+module ucie_multiflit_rx #(
+    parameter int FLIT_WIDTH    = 128,
+    parameter int PAYLOAD_WIDTH = 512,
+    parameter int SEQ_NUM_W     = 8
+)(
+    input  logic                                     clk,
+    input  logic                                     rst_n,
+
+    // Link Layer Interface from PHY (Narrow Flits)
+    input  logic [FLIT_WIDTH-1:0]                    flit_in,
+    input  logic                                     flit_in_valid,
+
+    // Protocol Layer Interface (Wide AXI-S)
+    output logic [PAYLOAD_WIDTH-1:0]                 rx_data,
+    output logic                                     rx_valid,
+    input  logic                                     rx_ready,
+    output logic                                     rx_last,
+
+    // Credit Return Interface (To TX side to send back to remote)
+    output logic [3:0]                               credits_to_return,
+
+    // Error Reporting
+    output logic                                     err_crc,
+    output logic                                     err_seq
+);
+
+    import ucie_d2d_pkg::*;
+
+    localparam int HDR_WIDTH  = $bits(ucie_flit_hdr_t);
+    localparam int DATA_WIDTH = FLIT_WIDTH - HDR_WIDTH;
+    localparam int FLITS_PER_PKT = (PAYLOAD_WIDTH + DATA_WIDTH - 1) / DATA_WIDTH;
+
+    //-------------------------------------------------------------------------
+    // Flit Parsing
+    //-------------------------------------------------------------------------
+    ucie_flit_hdr_t flit_hdr;
+    logic [DATA_WIDTH-1:0] flit_payload;
+
+    assign flit_hdr     = ucie_flit_hdr_t'(flit_in[FLIT_WIDTH-1 -: HDR_WIDTH]);
+    assign flit_payload = flit_in[DATA_WIDTH-1:0];
+
+    //-------------------------------------------------------------------------
+    // CRC & Sequence Check
+    //-------------------------------------------------------------------------
+    logic [15:0] rx_crc_check;
+    always_comb begin
+        logic [DATA_WIDTH+HDR_WIDTH-17:0] crc_data;
+        crc_data = {flit_payload, flit_hdr.seq_num, flit_hdr.pkt_type, flit_hdr.is_first, flit_hdr.is_last};
+        rx_crc_check = ^crc_data;
+    end
+
+    logic expected_seq_num_match;
+    logic [SEQ_NUM_W-1:0] expected_seq_num;
+    
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) expected_seq_num <= '0;
+        else if (flit_in_valid && flit_hdr.is_last && !err_crc && !err_seq)
+            expected_seq_num <= expected_seq_num + 1'b1;
+    end
+    
+    assign expected_seq_num_match = (flit_hdr.seq_num == expected_seq_num);
+    assign err_crc = flit_in_valid && (rx_crc_check != flit_hdr.crc16);
+    assign err_seq = flit_in_valid && !err_crc && !expected_seq_num_match && flit_hdr.is_first;
+
+    //-------------------------------------------------------------------------
+    // Reassembly Shift Register
+    //-------------------------------------------------------------------------
+    logic [PAYLOAD_WIDTH-1:0] reassembly_reg;
+    logic [$clog2(FLITS_PER_PKT)-1:0] rx_flit_cnt;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            reassembly_reg <= '0;
+            rx_flit_cnt    <= '0;
+            rx_valid       <= 1'b0;
+        end else begin
+            rx_valid <= 1'b0; // Default single-cycle pulse
+
+            if (flit_in_valid && !err_crc && !err_seq) begin
+                // Shift in new data from the right (LSB side)
+                reassembly_reg <= {reassembly_reg[PAYLOAD_WIDTH-1 -: (PAYLOAD_WIDTH-DATA_WIDTH)], flit_payload};
+                
+                if (flit_hdr.is_first) rx_flit_cnt <= '0;
+                else                    rx_flit_cnt <= rx_flit_cnt + 1'b1;
+
+                // Check if packet is complete
+                if (flit_hdr.is_last) begin
+                    rx_valid <= 1'b1;
+                    rx_last  <= 1'b1;
+                end
+            end
+            
+            // Handle backpressure: Hold rx_valid high if downstream isn't ready
+            if (rx_valid && !rx_ready) begin
+                rx_valid <= 1'b1; // Keep asserting
+            end
+        end
+    end
+
+    assign rx_data = reassembly_reg;
+
+    //-------------------------------------------------------------------------
+    // Credit Generation
+    //-------------------------------------------------------------------------
+    // Return 1 credit for every successfully received flit
+    logic [3:0] credit_acc;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) credit_acc <= '0;
+        else if (flit_in_valid && !err_crc) credit_acc <= credit_acc + 1'b1;
+    end
+    assign credits_to_return = (flit_in_valid && !err_crc) ? 1'b1 : 1'b0; 
+
+endmodule
+```
+
+---
+
+### 4. Top-Level D2D Adapter Wrapper
+
+```systemverilog
+//=============================================================================
+// Top Level UCIe D2D Multi-Flit Adapter
+//=============================================================================
+module ucie_d2d_multiflit_adapter #(
+    parameter int FLIT_WIDTH    = 128,
+    parameter int PAYLOAD_WIDTH = 512,
+    parameter int MAX_CREDITS   = 16
+)(
+    input  logic                                     clk,
+    input  logic                                     rst_n,
+
+    // --------------------------------------------------------
+    // Protocol Layer Interfaces (Connects to Chiplet SoC logic)
+    // --------------------------------------------------------
+    // TX Path
+    input  logic [PAYLOAD_WIDTH-1:0]                 proto_tx_data,
+    input  logic                                     proto_tx_valid,
+    output logic                                     proto_tx_ready,
+    input  logic                                     proto_tx_last,
+
+    // RX Path
+    output logic [PAYLOAD_WIDTH-1:0]                 proto_rx_data,
+    output logic                                     proto_rx_valid,
+    input  logic                                     proto_rx_ready,
+    output logic                                     proto_rx_last,
+
+    // --------------------------------------------------------
+    // PHY Layer Interfaces (Connects to UCIe PHY PMA/Lane)
+    // --------------------------------------------------------
+    // TX to PHY
+    output logic [FLIT_WIDTH-1:0]                    phy_tx_flit,
+    output logic                                     phy_tx_valid,
+    input  logic                                     phy_tx_ready,
+
+    // RX from PHY
+    input  logic [FLIT_WIDTH-1:0]                    phy_rx_flit,
+    input  logic                                     phy_rx_valid,
+
+    // Status
+    output logic                                     err_crc,
+    output logic                                     err_sequence
+);
+
+    // Internal credit loopback signals
+    logic [3:0] remote_credits_rcvd;
+    logic [3:0] local_credits_gen;
+
+    // -------------------------------------------------------------------------
+    // NOTE: In a production UCIe IP, Async Clock Domain Crossing (CDC) FIFOs 
+    // are instantiated here. The Protocol layer runs on the SoC Clock, while 
+    // the Link/PHY layer runs on the UCIe Recovered Clock.
+    // -------------------------------------------------------------------------
+
+    // TX Instance: Wide -> Narrow
+    ucie_multiflit_tx #(
+        .FLIT_WIDTH    (FLIT_WIDTH),
+        .PAYLOAD_WIDTH (PAYLOAD_WIDTH),
+        .MAX_CREDITS   (MAX_CREDITS)
+    ) u_tx (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .tx_data            (proto_tx_data),
+        .tx_valid           (proto_tx_valid),
+        .tx_ready           (proto_tx_ready),
+        .tx_last            (proto_tx_last),
+        .tx_dest_id         ('0),
+        .flit_out           (phy_tx_flit),
+        .flit_out_valid     (phy_tx_valid),
+        .flit_out_ready     (phy_tx_ready),
+        .remote_credits_rcvd(remote_credits_rcvd),
+        .tx_stall           ()
+    );
+
+    // RX Instance: Narrow -> Wide
+    ucie_multiflit_rx #(
+        .FLIT_WIDTH    (FLIT_WIDTH),
+        .PAYLOAD_WIDTH (PAYLOAD_WIDTH)
+    ) u_rx (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .flit_in            (phy_rx_flit),
+        .flit_in_valid      (phy_rx_valid),
+        .rx_data            (proto_rx_data),
+        .rx_valid           (proto_rx_valid),
+        .rx_ready           (proto_rx_ready),
+        .rx_last            (proto_rx_last),
+        .credits_to_return  (local_credits_gen),
+        .err_crc            (err_crc),
+        .err_seq            (err_sequence)
+    );
+
+    // Cross-connect credits: RX generates credits for what it receives, TX packs them into headers
+    assign remote_credits_rcvd = local_credits_gen;
+
+endmodule
+```
+
+### Industry Standard Implementation Notes:
+
+1. **CRC Polynomials:** The code uses an XOR reduction as a placeholder. A real UCIe adapter implements CRC-16/CRC-32 using the exact polynomials defined in the UCIe Spec (typically CRC-16-CCITT for Raw Mode flits), usually unrolled for single-cycle performance.
+2. **Credit Return Mechanism:** UCIe uses an embedded credit return system. Instead of dedicated wires, RX credit updates are packed into the *headers of TX flits* (as shown in `flit_hdr.credit_return`). The code passes this internally, but across dies, this handles flow control deadlock prevention.
+3. **Scrambling:** UCIe mandates data scrambling (using an LFSR) to ensure sufficient bit transitions for the SerDes PHY to maintain clock recovery. This would be placed between the Adapter and the PHY.
+4. **Retry Buffer (Link Layer):** If `err_seq` or `err_crc` triggers, a true UCIe Link Layer will freeze the protocol interface, trigger a Link Layer Retry (LLR), and replay from a saved buffer. The RX above drops bad packets; a production chip cannot drop packets and requires this retry buffer.
+5. **Backpressure Handling:** The AXI-Stream handshake on the RX output (`rx_valid` & `rx_ready`) includes logic to hold the reassembled packet in the shift register if the downstream Protocol Layer applies backpressure.

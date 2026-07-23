@@ -1,0 +1,77 @@
+//==============================================================================
+// Simple 2D Barrel Shifter - Combinatorial
+//==============================================================================
+// Performs horizontal and vertical shifts using built-in operators
+//==============================================================================
+module barrel_shifter_2d_simple #(
+    parameter int NUM_ROWS = 4,                    // Number of words
+    parameter int NUM_COLS = 32,                   // Bits per word
+    parameter int SHAMT_H_WIDTH = $clog2(NUM_COLS), // Horizontal shift width
+    parameter int SHAMT_V_WIDTH = $clog2(NUM_ROWS)  // Vertical shift width
+)(
+    input  logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_in,
+    input  logic [SHAMT_H_WIDTH-1:0]          shamt_h,
+    input  logic [SHAMT_V_WIDTH-1:0]          shamt_v,
+    input  logic                              left_h,     // 0: right, 1: left
+    input  logic                              up_v,       // 0: down, 1: up  
+    input  logic                              arithmetic, // 0: logical, 1: arithmetic
+    
+    output logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_out
+);
+
+    // Internal signal after horizontal shift
+    logic [NUM_ROWS-1:0][NUM_COLS-1:0] h_shifted;
+    
+    //==========================================================================
+    // Horizontal Shift Stage - Shift each row independently
+    //==========================================================================
+    always_comb begin
+        for (int row = 0; row < NUM_ROWS; row++) begin
+            if (left_h) begin
+                // Left shift (always logical)
+                h_shifted[row] = data_in[row] << shamt_h;
+            end else begin
+                // Right shift
+                if (arithmetic) begin
+                    h_shifted[row] = data_in[row] >>> shamt_h;
+                end else begin
+                    h_shifted[row] = data_in[row] >> shamt_h;
+                end
+            end
+        end
+    end
+    
+    //==========================================================================
+    // Vertical Shift Stage - Shift rows up or down
+    //==========================================================================
+    always_comb begin
+        for (int row = 0; row < NUM_ROWS; row++) begin
+            int src_row;
+            
+            if (up_v) begin
+                // Shift up: row[i] gets data from row[i + shamt_v]
+                src_row = row + shamt_v;
+                if (src_row < NUM_ROWS) begin
+                    data_out[row] = h_shifted[src_row];
+                end else if (arithmetic) begin
+                    // Arithmetic: sign extend from top row
+                    data_out[row] = {NUM_COLS{h_shifted[NUM_ROWS-1][NUM_COLS-1]}};
+                end else begin
+                    data_out[row] = '0;
+                end
+            end else begin
+                // Shift down: row[i] gets data from row[i - shamt_v]
+                src_row = row - shamt_v;
+                if (src_row >= 0) begin
+                    data_out[row] = h_shifted[src_row];
+                end else if (arithmetic) begin
+                    // Arithmetic: sign extend from bottom row
+                    data_out[row] = {NUM_COLS{h_shifted[0][NUM_COLS-1]}};
+                end else begin
+                    data_out[row] = '0;
+                end
+            end
+        end
+    end
+
+endmodule

@@ -1,0 +1,172 @@
+//==============================================================================
+// 2D Barrel Shifter with Wrap-Around (Toroidal Shift)
+//==============================================================================
+// Supports circular shifts in both dimensions
+//==============================================================================
+module barrel_shifter_2d_wrap #(
+    parameter int NUM_ROWS = 4,
+    parameter int NUM_COLS = 32,
+    parameter int SHAMT_H_WIDTH = $clog2(NUM_COLS),
+    parameter int SHAMT_V_WIDTH = $clog2(NUM_ROWS)
+)(
+    input  logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_in,
+    input  logic [SHAMT_H_WIDTH-1:0]          shamt_h,
+    input  logic [SHAMT_V_WIDTH-1:0]          shamt_v,
+    input  logic                              left_h,
+    input  logic                              up_v,
+    input  logic                              wrap_h,     // Enable horizontal wrap
+    input  logic                              wrap_v,     // Enable vertical wrap
+    input  logic                              arithmetic,
+    
+    output logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_out
+);
+
+    // Flatten 2D array for easier circular manipulation
+    logic [NUM_ROWS*NUM_COLS-1:0] flat_in, flat_out;
+    logic [SHAMT_H_WIDTH+SHAMT_V_WIDTH-1:0] total_shift;
+    
+    //==========================================================================
+    // Flatten 2D input to 1D
+    // Row 0 is MSBs, Row NUM_ROWS-1 is LSBs
+    //==========================================================================
+    always_comb begin
+        for (int row = 0; row < NUM_ROWS; row++) begin
+            flat_in[row*NUM_COLS +: NUM_COLS] = data_in[row];
+        end
+    end
+    
+    //==========================================================================
+    // Calculate combined shift amount
+    // For wrap-around: total_shift = vertical_shift * NUM_COLS + horizontal_shift
+    //==========================================================================
+    always_comb begin
+        if (up_v) begin
+            // Shift up means lower rows move to higher positions
+            // In flat representation, this is a left shift
+            if (left_h) begin
+                total_shift = shamt_v * NUM_COLS + shamt_h;
+            end else begin
+                total_shift = shamt_v * NUM_COLS - shamt_h;
+            end
+        end else begin
+            // Shift down means higher rows move to lower positions
+            // In flat representation, this is a right shift
+            if (left_h) begin
+                total_shift = -(int'(shamt_v) * NUM_COLS) + shamt_h;
+            end else begin
+                total_shift = -(int'(shamt_v) * NUM_COLS) - shamt_h;
+            end
+        end
+    end
+    
+    //==========================================================================
+    // Perform the shift with wrap-around support
+    //==========================================================================
+    localparam int TOTAL_BITS = NUM_ROWS * NUM_COLS;
+    localparam int TOTAL_SHIFT_WIDTH = $clog2(TOTAL_BITS) + 1; // +1 for sign
+    
+    always_comb begin
+        if (wrap_h && wrap_v) begin
+            // Full 2D wrap-around (circular shift)
+            logic [TOTAL_BITS-1:0] shifted;
+            shifted = (flat_in <<< total_shift[TOTAL_SHIFT_WIDTH-1:0]);
+            flat_out = shifted;
+        end else if (wrap_v) begin
+            // Only vertical wrap, horizontal zero/sign fill
+            logic [NUM_ROWS-1:0][NUM_COLS-1:0] v_shifted;
+            
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                int src_row;
+                if (up_v) begin
+                    src_row = (row + shamt_v) % NUM_ROWS;
+                end else begin
+                    src_row = (row - shamt_v + NUM_ROWS) % NUM_ROWS;
+                end
+                v_shifted[row] = data_in[src_row];
+            end
+            
+            // Apply horizontal shift
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                if (left_h) begin
+                    flat_out[row*NUM_COLS +: NUM_COLS] = v_shifted[row] << shamt_h;
+                end else begin
+                    if (arithmetic) begin
+                        flat_out[row*NUM_COLS +: NUM_COLS] = v_shifted[row] >>> shamt_h;
+                    end else begin
+                        flat_out[row*NUM_COLS +: NUM_COLS] = v_shifted[row] >> shamt_h;
+                    end
+                end
+            end
+        end else if (wrap_h) begin
+            // Only horizontal wrap, vertical zero/sign fill
+            logic [NUM_ROWS-1:0][NUM_COLS-1:0] h_shifted;
+            
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                h_shifted[row] = (data_in[row] <<< shamt_h);
+            end
+            
+            // Apply vertical shift
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                int src_row;
+                if (up_v) begin
+                    src_row = row + shamt_v;
+                end else begin
+                    src_row = row - shamt_v;
+                end
+                
+                if (src_row >= 0 && src_row < NUM_ROWS) begin
+                    flat_out[row*NUM_COLS +: NUM_COLS] = h_shifted[src_row];
+                end else if (arithmetic) begin
+                    flat_out[row*NUM_COLS +: NUM_COLS] = 
+                        {NUM_COLS{h_shifted[up_v ? NUM_ROWS-1 : 0][NUM_COLS-1]}};
+                end else begin
+                    flat_out[row*NUM_COLS +: NUM_COLS] = '0;
+                end
+            end
+        end else begin
+            // No wrap - standard shift with zero/sign fill
+            logic [NUM_ROWS-1:0][NUM_COLS-1:0] h_shifted;
+            logic [NUM_ROWS-1:0][NUM_COLS-1:0] v_shifted;
+            
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                if (left_h) begin
+                    h_shifted[row] = data_in[row] << shamt_h;
+                end else begin
+                    if (arithmetic) begin
+                        h_shifted[row] = data_in[row] >>> shamt_h;
+                    end else begin
+                        h_shifted[row] = data_in[row] >> shamt_h;
+                    end
+                end
+            end
+            
+            for (int row = 0; row < NUM_ROWS; row++) begin
+                int src_row;
+                if (up_v) begin
+                    src_row = row + shamt_v;
+                end else begin
+                    src_row = row - shamt_v;
+                end
+                
+                if (src_row >= 0 && src_row < NUM_ROWS) begin
+                    v_shifted[row] = h_shifted[src_row];
+                end else if (arithmetic) begin
+                    v_shifted[row] = {NUM_COLS{h_shifted[up_v ? NUM_ROWS-1 : 0][NUM_COLS-1]}};
+                end else begin
+                    v_shifted[row] = '0;
+                end
+                flat_out[row*NUM_COLS +: NUM_COLS] = v_shifted[row];
+            end
+        end
+    end
+    
+    //==========================================================================
+    // Unflatten 1D output to 2D
+    //==========================================================================
+    always_comb begin
+        for (int row = 0; row < NUM_ROWS; row++) begin
+            data_out[row] = flat_out[row*NUM_COLS +: NUM_COLS];
+        end
+    end
+
+endmodule

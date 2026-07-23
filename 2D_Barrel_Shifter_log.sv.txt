@@ -1,0 +1,220 @@
+//==============================================================================
+// Logarithmic 2D Barrel Shifter - Pipelined
+//==============================================================================
+// Uses logarithmic shift stages for optimal timing
+// Each stage shifts by power-of-2 amounts: 1, 2, 4, 8, ...
+//==============================================================================
+module barrel_shifter_2d_log #(
+    parameter int NUM_ROWS = 4,
+    parameter int NUM_COLS = 32,
+    parameter int SHAMT_H_WIDTH = $clog2(NUM_COLS),
+    parameter int SHAMT_V_WIDTH = $clog2(NUM_ROWS)
+)(
+    input  logic                              clk,
+    input  logic                              rst_n,
+    input  logic                              valid_in,
+    input  logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_in,
+    input  logic [SHAMT_H_WIDTH-1:0]          shamt_h,
+    input  logic [SHAMT_V_WIDTH-1:0]          shamt_v,
+    input  logic                              left_h,
+    input  logic                              up_v,
+    input  logic                              arithmetic,
+    
+    output logic                              valid_out,
+    output logic [NUM_ROWS-1:0][NUM_COLS-1:0] data_out
+);
+
+    localparam int H_STAGES = SHAMT_H_WIDTH;
+    localparam int V_STAGES = SHAMT_V_WIDTH;
+    localparam int TOTAL_STAGES = H_STAGES + V_STAGES + 2; // +2 for input/output regs
+    
+    // Pipeline registers for data
+    logic [NUM_ROWS-1:0][NUM_COLS-1:0] pipe_data [0:TOTAL_STAGES-1];
+    
+    // Pipeline registers for control signals
+    logic [SHAMT_H_WIDTH-1:0] pipe_shamt_h [0:H_STAGES];
+    logic [SHAMT_V_WIDTH-1:0] pipe_shamt_v [0:V_STAGES];
+    logic pipe_left_h [0:H_STAGES];
+    logic pipe_up_v [0:V_STAGES];
+    logic pipe_arith [0:TOTAL_STAGES-1];
+    logic pipe_valid [0:TOTAL_STAGES-1];
+    
+    //==========================================================================
+    // Input Pipeline Stage
+    //==========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pipe_data[0] <= '0;
+            pipe_shamt_h[0] <= '0;
+            pipe_left_h[0] <= '0;
+            pipe_arith[0] <= '0;
+            pipe_valid[0] <= 1'b0;
+        end else begin
+            pipe_data[0] <= data_in;
+            pipe_shamt_h[0] <= shamt_h;
+            pipe_left_h[0] <= left_h;
+            pipe_arith[0] <= arithmetic;
+            pipe_valid[0] <= valid_in;
+        end
+    end
+    
+    //==========================================================================
+    // Horizontal Shift Stages (Logarithmic)
+    //==========================================================================
+    generate
+        for (genvar s = 0; s < H_STAGES; s++) begin : h_stage_gen
+            localparam int SHIFT_AMT = (1 << s);
+            
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    pipe_data[s+1] <= '0;
+                    pipe_shamt_h[s+1] <= '0;
+                    pipe_left_h[s+1] <= '0;
+                    pipe_arith[s+1] <= '0;
+                    pipe_valid[s+1] <= 1'b0;
+                end else begin
+                    // Propagate control signals
+                    pipe_shamt_h[s+1] <= pipe_shamt_h[s];
+                    pipe_left_h[s+1] <= pipe_left_h[s];
+                    pipe_arith[s+1] <= pipe_arith[s];
+                    pipe_valid[s+1] <= pipe_valid[s];
+                    
+                    for (int row = 0; row < NUM_ROWS; row++) begin
+                        if (pipe_shamt_h[s][s]) begin
+                            if (pipe_left_h[s]) begin
+                                // Left shift by 2^s positions
+                                if (SHIFT_AMT >= NUM_COLS) begin
+                                    pipe_data[s+1][row] <= '0;
+                                end else begin
+                                    pipe_data[s+1][row][NUM_COLS-1:SHIFT_AMT] <= 
+                                        pipe_data[s][row][NUM_COLS-1-SHIFT_AMT:0];
+                                    pipe_data[s+1][row][SHIFT_AMT-1:0] <= '0;
+                                end
+                            end else begin
+                                // Right shift by 2^s positions
+                                if (SHIFT_AMT >= NUM_COLS) begin
+                                    if (pipe_arith[s]) begin
+                                        pipe_data[s+1][row] <= {NUM_COLS{pipe_data[s][row][NUM_COLS-1]}};
+                                    end else begin
+                                        pipe_data[s+1][row] <= '0;
+                                    end
+                                end else begin
+                                    pipe_data[s+1][row][NUM_COLS-1-SHIFT_AMT:0] <= 
+                                        pipe_data[s][row][NUM_COLS-1:SHIFT_AMT];
+                                    if (pipe_arith[s]) begin
+                                        pipe_data[s+1][row][NUM_COLS-1:NUM_COLS-SHIFT_AMT] <= 
+                                            {SHIFT_AMT{pipe_data[s][row][NUM_COLS-1]}};
+                                    end else begin
+                                        pipe_data[s+1][row][NUM_COLS-1:NUM_COLS-SHIFT_AMT] <= '0;
+                                    end
+                                end
+                            end
+                        end else begin
+                            // Pass through
+                            pipe_data[s+1][row] <= pipe_data[s][row];
+                        end
+                    end
+                end
+            end
+        end
+    endgenerate
+    
+    //==========================================================================
+    // Vertical Shift Control Capture
+    //==========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pipe_shamt_v[0] <= '0;
+            pipe_up_v[0] <= '0;
+        end else begin
+            pipe_shamt_v[0] <= shamt_v;
+            pipe_up_v[0] <= up_v;
+        end
+    end
+    
+    // Propagate vertical control through horizontal stages
+    generate
+        for (genvar s = 0; s < H_STAGES; s++) begin : v_ctrl_prop
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    pipe_shamt_v[s+1] <= '0;
+                    pipe_up_v[s+1] <= '0;
+                end else begin
+                    pipe_shamt_v[s+1] <= pipe_shamt_v[s];
+                    pipe_up_v[s+1] <= pipe_up_v[s];
+                end
+            end
+        end
+    endgenerate
+    
+    //==========================================================================
+    // Vertical Shift Stages (Logarithmic)
+    //==========================================================================
+    generate
+        for (genvar s = 0; s < V_STAGES; s++) begin : v_stage_gen
+            localparam int SHIFT_AMT = (1 << s);
+            localparam int STAGE_IDX = H_STAGES + 1 + s;
+            
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    pipe_data[STAGE_IDX] <= '0;
+                    pipe_shamt_v[s+1] <= '0;
+                    pipe_up_v[s+1] <= '0;
+                    pipe_arith[STAGE_IDX] <= '0;
+                    pipe_valid[STAGE_IDX] <= 1'b0;
+                end else begin
+                    pipe_shamt_v[s+1] <= pipe_shamt_v[s];
+                    pipe_up_v[s+1] <= pipe_up_v[s];
+                    pipe_arith[STAGE_IDX] <= pipe_arith[STAGE_IDX-1];
+                    pipe_valid[STAGE_IDX] <= pipe_valid[STAGE_IDX-1];
+                    
+                    for (int row = 0; row < NUM_ROWS; row++) begin
+                        if (pipe_shamt_v[s][s]) begin
+                            int src_row;
+                            
+                            if (pipe_up_v[s]) begin
+                                // Shift up: row[i] = row[i + 2^s]
+                                src_row = row + SHIFT_AMT;
+                                if (src_row < NUM_ROWS) begin
+                                    pipe_data[STAGE_IDX][row] <= pipe_data[STAGE_IDX-1][src_row];
+                                end else if (pipe_arith[STAGE_IDX]) begin
+                                    pipe_data[STAGE_IDX][row] <= 
+                                        {NUM_COLS{pipe_data[STAGE_IDX-1][NUM_ROWS-1][NUM_COLS-1]}};
+                                end else begin
+                                    pipe_data[STAGE_IDX][row] <= '0;
+                                end
+                            end else begin
+                                // Shift down: row[i] = row[i - 2^s]
+                                src_row = row - SHIFT_AMT;
+                                if (src_row >= 0) begin
+                                    pipe_data[STAGE_IDX][row] <= pipe_data[STAGE_IDX-1][src_row];
+                                end else if (pipe_arith[STAGE_IDX]) begin
+                                    pipe_data[STAGE_IDX][row] <= 
+                                        {NUM_COLS{pipe_data[STAGE_IDX-1][0][NUM_COLS-1]}};
+                                end else begin
+                                    pipe_data[STAGE_IDX][row] <= '0;
+                                end
+                            end
+                        end else begin
+                            pipe_data[STAGE_IDX][row] <= pipe_data[STAGE_IDX-1][row];
+                        end
+                    end
+                end
+            end
+        end
+    endgenerate
+    
+    //==========================================================================
+    // Output Pipeline Stage
+    //==========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            data_out <= '0;
+            valid_out <= 1'b0;
+        end else begin
+            data_out <= pipe_data[TOTAL_STAGES-1];
+            valid_out <= pipe_valid[TOTAL_STAGES-1];
+        end
+    end
+
+endmodule

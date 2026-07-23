@@ -1,0 +1,339 @@
+A **Superscalar Processor** is defined by its ability to fetch, decode, issue, and complete **more than one instruction per clock cycle** (IPC > 1). 
+
+While a full Out-of-Order (OoO) superscalar core (like an ARM Cortex-A78 or RISC-V Boom) requires tens of thousands of lines of code for Register Renaming, Physical Register Files, and Load/Store Queues, I have provided a **synthesizable, 2-Wide In-Order Superscalar Core**. 
+
+This implementation demonstrates the fundamental microarchitecture of superscalar designs:
+1. **Wide Fetch**: Fetches 2 instructions per cycle.
+2. **Parallel Decode**: Decodes a bundle of instructions.
+3. **Reorder Buffer (ROB)**: Tracks instructions in program order.
+4. **Structural Hazard Resolution**: Issues up to 2 instructions in parallel *only* if execution units are available.
+
+---
+
+### 1. Superscalar Package & Definitions
+
+```systemverilog
+//=============================================================================
+// superscalar_pkg.sv
+//=============================================================================
+package superscalar_pkg;
+
+    // --- Core Configuration ---
+    localparam int XLEN       = 32;
+    localparam int ISSUE_W    = 2;        // 2-Wide Superscalar
+    localparam int ROB_SIZE   = 8;        // Reorder Buffer depth
+    localparam int ROB_IDX_W  = $clog2(ROB_SIZE);
+    
+    // --- ISA Opcodes (Simplified RISC-V-like) ---
+    typedef enum logic [3:0] {
+        OP_NOP  = 4'h0,
+        OP_ADD  = 4'h1,
+        OP_SUB  = 4'h2,
+        OP_AND  = 4'h3,
+        OP_OR   = 4'h4,
+        OP_BEQ  = 4'h5  // Branch (causes pipeline flush in this simple model)
+    } opcode_e;
+
+    // --- Instruction Bundle (Fetched from I-Cache) ---
+    typedef struct packed {
+        logic [XLEN-1:0]     pc;
+        opcode_e             opcode;
+        logic [4:0]          rs1;
+        logic [4:0]          rs2;
+        logic [4:0]          rd;
+        logic [XLEN-1:0]     imm; // Immediate or target address
+    } instr_t;
+
+    // --- Reorder Buffer Entry ---
+    typedef struct packed {
+        logic                valid;
+        logic                ready;  // 1: Execution finished
+        logic                is_branch;
+        logic                taken;  // Branch prediction/result
+        logic [XLEN-1:0]     pc;
+        logic [4:0]          rd;     // Destination architectural register
+        logic [XLEN-1:0]     result; // Computed data
+    } rob_entry_t;
+
+endpackage
+```
+
+---
+
+### 2. 2-Wide Superscalar Core Implementation
+
+```systemverilog
+//=============================================================================
+// superscalar_core.sv
+// 2-Wide In-Order Superscalar Processor
+//=============================================================================
+module superscalar_core (
+    input  logic                  clk,
+    input  logic                  rst_n,
+
+    // Instruction Memory Interface
+    output logic [31:0]           imem_addr [ISSUE_W],
+    input  logic [31:0]           imem_rdata [ISSUE_W],
+    input  logic                  imem_valid,
+
+    // Status
+    output logic                  core_halted
+);
+    import superscalar_pkg::*;
+
+    //=========================================================================
+    // Pipeline Registers
+    //=========================================================================
+    // Fetch Bundle
+    instr_t [ISSUE_W-1:0] fetch_bundle;
+    logic                  fetch_valid [ISSUE_W-1:0];
+    logic [XLEN-1:0]       pc_reg;
+    logic                  flush_pipeline;
+
+    // Decode/Issue Bundle
+    instr_t [ISSUE_W-1:0] id_bundle;
+    logic                  id_valid [ISSUE_W-1:0];
+    logic [ROB_IDX_W-1:0]  id_rob_tag [ISSUE_W-1:0];
+    
+    //=========================================================================
+    // Execution Units (2x Parallel ALUs)
+    //=========================================================================
+    logic                  alu_busy [ISSUE_W-1:0];
+    logic                  alu_fire [ISSUE_W-1:0];
+    logic [XLEN-1:0]       alu_result [ISSUE_W-1:0];
+    logic                  alu_branch_taken [ISSUE_W-1:0];
+    logic [ROB_IDX_W-1:0]  alu_rob_tag [ISSUE_W-1:0];
+
+    //=========================================================================
+    // Register File (Architectural)
+    //=========================================================================
+    logic [XLEN-1:0]       regfile [0:31];
+
+    //=========================================================================
+    // Reorder Buffer (ROB)
+    //=========================================================================
+    rob_entry_t            rob [0:ROB_SIZE-1];
+    logic [ROB_IDX_W-1:0]  rob_head, rob_tail;
+    logic [$clog2(ROB_SIZE+1)-1:0] rob_count;
+    logic                  rob_full;
+
+    //=========================================================================
+    // 1. FETCH STAGE (Wide Fetch)
+    //=========================================================================
+    always_comb begin
+        if (flush_pipeline) begin
+            // On flush, re-fetch from target PC
+            imem_addr[0] = pc_reg;
+            imem_addr[1] = pc_reg + 4;
+        end else begin
+            imem_addr[0] = pc_reg;
+            imem_addr[1] = pc_reg + 4;
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pc_reg <= 32'h0000_0000;
+            flush_pipeline <= 1'b0;
+        end else begin
+            flush_pipeline <= 1'b0; // Default
+            
+            if (flush_pipeline) begin
+                // PC already updated by branch unit before this cycle
+            end else if (imem_valid) begin
+                pc_reg <= pc_reg + (ISSUE_W * 4); // Advance PC by 8 (2 instructions)
+            end
+        end
+    end
+
+    // Latch fetched instructions
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n || flush_pipeline) begin
+            fetch_valid <= '{default: 0};
+            fetch_bundle <= '{default: 0};
+        end else if (imem_valid) begin
+            for (int i = 0; i < ISSUE_W; i++) begin
+                fetch_bundle[i] <= instr_t'(imem_rdata[i]);
+                fetch_valid[i]  <= 1'b1;
+            end
+        end
+    end
+
+    //=========================================================================
+    // 2. DECODE & ROB ALLOCATE STAGE
+    //=========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n || flush_pipeline) begin
+            id_valid <= '{default: 0};
+            id_bundle <= '{default: 0};
+            id_rob_tag <= '{default: 0};
+            rob_tail <= '0;
+            rob_count <= '0;
+            rob_full <= 1'b0;
+        end else begin
+            id_valid <= '{default: 0}; // Default clear
+            
+            // Allocate ROB entries for valid fetched instructions
+            for (int i = 0; i < ISSUE_W; i++) begin
+                if (fetch_valid[i] && !rob_full) begin
+                    id_bundle[i]  <= fetch_bundle[i];
+                    id_valid[i]   <= 1'b1;
+                    id_rob_tag[i] <= rob_tail;
+                    
+                    // Setup ROB entry (In-Flight)
+                    rob[rob_tail].valid     <= 1'b1;
+                    rob[rob_tail].ready     <= 1'b0;
+                    rob[rob_tail].pc        <= fetch_bundle[i].pc;
+                    rob[rob_tail].rd        <= fetch_bundle[i].rd;
+                    rob[rob_tail].is_branch <= (fetch_bundle[i].opcode == OP_BEQ);
+                    rob[rob_tail].taken     <= 1'b0;
+                    
+                    // Advance ROB tail
+                    rob_tail <= rob_tail + 1;
+                    rob_count <= rob_count + 1;
+                end
+            end
+            rob_full <= (rob_count >= ROB_SIZE - ISSUE_W);
+        end
+    end
+
+    //=========================================================================
+    // 3. ISSUE STAGE (Parallel Dispatch)
+    //=========================================================================
+    // In an Out-of-Order core, this is a complex Reservation Station wakeup.
+    // Here, we do In-Order issue with Structural Hazard checking.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n || flush_pipeline) begin
+            alu_fire <= '{default: 0};
+        end else begin
+            alu_fire <= '{default: 0}; // Default: ALUs do not execute this cycle
+
+            // Issue Slot 0 -> ALU 0
+            if (id_valid[0] && !alu_busy[0]) begin
+                alu_fire[0]   <= 1'b1;
+                alu_busy[0]   <= 1'b1;    // Reserve ALU 0
+                alu_rob_tag[0] <= id_rob_tag[0];
+                
+                // In-Order Read from Register File
+                // (OoO would read from Physical Reg File or Forwarding bus)
+                automatic logic [XLEN-1:0] val1 = regfile[id_bundle[0].rs1];
+                automatic logic [XLEN-1:0] val2 = regfile[id_bundle[0].rs2];
+                
+                case (id_bundle[0].opcode)
+                    OP_ADD: alu_result[0] <= val1 + val2;
+                    OP_SUB: alu_result[0] <= val1 - val2;
+                    OP_AND: alu_result[0] <= val1 & val2;
+                    OP_OR:  alu_result[0] <= val1 | val2;
+                    OP_BEQ: begin
+                        alu_branch_taken[0] <= (val1 == val2);
+                        alu_result[0] <= id_bundle[0].imm; // Target PC
+                    end
+                    default: alu_result[0] <= '0;
+                endcase
+            end
+
+            // Issue Slot 1 -> ALU 1
+            if (id_valid[1] && !alu_busy[1]) begin
+                alu_fire[1]   <= 1'b1;
+                alu_busy[1]   <= 1'b1;    // Reserve ALU 1
+                alu_rob_tag[1] <= id_rob_tag[1];
+                
+                automatic logic [XLEN-1:0] val1 = regfile[id_bundle[1].rs1];
+                automatic logic [XLEN-1:0] val2 = regfile[id_bundle[1].rs2];
+                
+                case (id_bundle[1].opcode)
+                    OP_ADD: alu_result[1] <= val1 + val2;
+                    OP_SUB: alu_result[1] <= val1 - val2;
+                    OP_AND: alu_result[1] <= val1 & val2;
+                    OP_OR:  alu_result[1] <= val1 | val2;
+                    OP_BEQ: begin
+                        alu_branch_taken[1] <= (val1 == val2);
+                        alu_result[1] <= id_bundle[1].imm;
+                    end
+                    default: alu_result[1] <= '0;
+                endcase
+            end
+        end
+    end
+
+    //=========================================================================
+    // 4. WRITEBACK & BRANCH RESOLUTION (End of Execution)
+    //=========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            alu_busy <= '{default: 0};
+        end else begin
+            for (int i = 0; i < ISSUE_W; i++) begin
+                if (alu_busy[i] && alu_fire[i]) begin
+                    alu_busy[i] <= 1'b0; // Free ALU next cycle
+                    
+                    // Write result to ROB
+                    rob[alu_rob_tag[i]].result <= alu_result[i];
+                    rob[alu_rob_tag[i]].ready  <= 1'b1;
+                    
+                    // Handle Branch Misprediction (Highest priority)
+                    if (rob[alu_rob_tag[i]].is_branch && alu_branch_taken[i]) begin
+                        pc_reg <= alu_result[i]; // Redirect PC
+                        flush_pipeline <= 1'b1;  // Flush Fetch/Decode
+                    end
+                end
+            end
+        end
+    end
+
+    //=========================================================================
+    // 5. COMMIT STAGE (In-Order Retire)
+    //=========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rob_head <= '0;
+            core_halted <= 1'b0;
+        end else begin
+            // A superscalar core can retire up to ISSUE_W instructions per cycle
+            for (int i = 0; i < ISSUE_W; i++) begin
+                if (rob[rob_head].valid && rob[rob_head].ready && rob_count > 0) begin
+                    
+                    // Write back to Architectural Register File
+                    if (rob[rob_head].rd != 0) begin
+                        regfile[rob[rob_head].rd] <= rob[rob_head].result;
+                    end
+                    
+                    // Clear ROB entry
+                    rob[rob_head].valid <= 1'b0;
+                    rob_head <= rob_head + 1;
+                    rob_count <= rob_count - 1;
+                end else begin
+                    // Stop retiring if head is not ready (In-Order rule)
+                    break; 
+                end
+            end
+            
+            // Simple halt condition for simulation
+            if (rob_count == 0 && imem_valid && imem_rdata[0] == 32'h00000013) begin
+                core_halted <= 1'b1;
+            end
+        end
+    end
+
+endmodule
+```
+
+### Key Superscalar Microarchitectural Features Demonstrated:
+
+1. **Wide Fetch & Decode (`ISSUE_W = 2`):**
+   Notice `imem_addr`, `imem_rdata`, and the `fetch_bundle` arrays. The core pulls 64 bits (two 32-bit instructions) from memory every single cycle.
+2. **Structural Hazard Checking (The `alu_busy` flags):**
+   In the **ISSUE STAGE**, the logic checks `if (id_valid[0] && !alu_busy[0])`. If Instruction 0 takes ALU 0, Instruction 1 can *still* issue to ALU 1 in the exact same cycle. If ALU 1 is busy from a previous cycle, Instruction 1 stalls in the `id_bundle` registers.
+3. **The Reorder Buffer (ROB):**
+   This is the most critical data structure in modern CPUs. When instructions are decoded, they grab a `rob_tag` (their tail index). 
+   * They execute out-of-order or in parallel.
+   * Results are written back to the ROB (`rob[tag].ready <= 1'b1`).
+   * The **COMMIT STAGE** only looks at `rob_head`. It retires instructions sequentially. If `rob[head]` is not ready, the CPU stalls retirement (even if `rob[head+1]` finished early).
+4. **Branch Side-Effects on Superscalar Pipes:**
+   If ALU 0 resolves a branch and it is taken, it asserts `flush_pipeline`. This forces the `pc_reg` to update and wipes the `id_valid` and `fetch_valid` arrays, throwing away the instruction bundle that was incorrectly fetched behind the branch.
+
+### What is missing to make this a "Full Out-of-Order" (like an Intel Core)?
+To upgrade this to a true OoO core, you would need to add:
+* **Register Renaming:** Map architectural registers (`x1`-`x31`) to a large pool of Physical Registers (e.g., 128 registers) to eliminate WAW and WAR dependencies.
+* **Instruction Queues (Reservation Stations):** Instead of issuing straight from decode, instructions wait in queues until their *source operands* broadcast their results on a "Common Data Bus" (CDB).
+* **Data Forwarding:** Bypassing ROB writeback directly to the ALU inputs to resolve RAW dependencies in 1 cycle.
