@@ -1,0 +1,14 @@
+FDI Stack 0 ─────┐
+                 │
+FDI Stack 1 ─────┤
+                 ▼
+             RR MUX
+                 │
+                 ▼
+        Retry/Replay controller
+                 │
+                 ▼
+          Rate Enforcer
+                 │
+                 ▼
+              UCIe TX

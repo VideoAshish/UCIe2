@@ -1,0 +1,31 @@
+                    UCIe 3.0 Adapter
+                           |
+         +-----------------+------------------+
+         |                                    |
+      Stack 0                              Stack 1
+         |                                    |
+         +----------------+-------------------+
+                          |
+                    Per-flit RR arbiter
+                          |
+                    MPG common flit
+                          |
+                    +-----+------+
+                    |            |
+                 FDI TX       Replay TX
+                    |            |
+                    +-----+------+
+                          |
+                 50% bandwidth
+                    enforcement
+                          |
+                     NOP insertion
+                          |
+                    Link TX flit
+                          |
+                    UCIe Link Layer
+                          |
+                         RDI
+                          |
+                         PHY
+                    48 / 64 GT/s
