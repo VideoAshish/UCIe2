@@ -1,0 +1,33 @@
+// ============================================================
+// TL-UH Atomic Operation ALU
+// Reference: OpenTitan tluh_mem_bridge_alu.sv[reference:46]
+// ============================================================
+
+module tluh_mem_bridge_alu #(
+    parameter int Width = 64
+) (
+    input  logic                     clk,
+    input  logic                     arst,
+    input  logic [2:0]               op,      // Atomic operation type
+    input  logic [Width-1:0]         a,       // Current memory value
+    input  logic [Width-1:0]         b,       // Operation operand
+    output logic [Width-1:0]         result
+);
+
+    always_comb begin
+        case (op)
+            // Arithmetic operations
+            ATOMIC_MIN:   result = (a < b) ? a : b;
+            ATOMIC_MAX:   result = (a > b) ? a : b;
+            ATOMIC_MINU:  result = ($unsigned(a) < $unsigned(b)) ? a : b;
+            ATOMIC_MAXU:  result = ($unsigned(a) > $unsigned(b)) ? a : b;
+            ATOMIC_ADD:   result = a + b;
+            ATOMIC_XOR:   result = a ^ b;
+            ATOMIC_OR:    result = a | b;
+            ATOMIC_AND:   result = a & b;
+            ATOMIC_SWAP:  result = b;
+            default:      result = a;
+        endcase
+    end
+
+endmodule
